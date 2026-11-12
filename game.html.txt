@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Ловец подарков и звёзд</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #14193a;
+    font-family: Arial, sans-serif;
+    touch-action: none;
+    user-select: none;
+  }
+  #game { display: block; width: 100%; height: 100%; }
+  #overlay {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    background: rgba(10, 15, 40, 0.9);
+    color: #fff; text-align: center;
+    padding: 20px;
+  }
+  #overlay.hidden { display: none; }
+  #overlay h1 { font-size: 32px; margin-bottom: 12px; }
+  #overlay p { font-size: 18px; margin-bottom: 20px; line-height: 1.5; }
+  #overlay button {
+    padding: 14px 32px;
+    font-size: 20px;
+    background: #ffcc28;
+    color: #14193a;
+    border: none;
+    border-radius: 12px;
+    cursor: pointer;
+    font-weight: bold;
+  }
+  #overlay button:active { transform: scale(0.96); }
+  .emoji-row { font-size: 40px; margin-bottom: 16px; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="overlay">
+  <h1>🎁 Ловец подарков ⭐</h1>
+  <div class="emoji-row">🎁 ⭐ 💣</div>
+  <p>
+    Лови <b>подарки</b> и <b>звёзды</b>,<br>
+    избегай <b>бомб</b>!<br><br>
+    Управление: тащи корзину пальцем<br>
+    или стрелками ← → на клавиатуре
+  </p>
+  <button id="startBtn">Играть</button>
+</div>
+
+<script>
+(function() {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const overlay = document.getElementById('overlay');
+  const startBtn = document.getElementById('startBtn');
+
+  let W, H, DPR;
+
+  function resize() {
+    DPR = window.devicePixelRatio || 1;
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * DPR;
+    canvas.height = H * DPR;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ==== СОСТОЯНИЕ ИГРЫ ====
+  const state = {
+    running: false,
+    over: false,
+    score: 0,
+    lives: 3,
+    playerX: 0,
+    playerW: 130,
+    playerH: 44,
+    objects: [],
+    lastSpawn: 0,
+    spawnInterval: 750,
+    lastFrame: 0,
+    stars: [], // фон
+    best: parseInt(localStorage.getItem('giftBest') || '0', 10),
+  };
+
+  // Звёзды на фоне (декор)
+  for (let i = 0; i < 60; i++) {
+    state.stars.push({
+      x: Math.random(),
+      y: Math.random(),
+      r: Math.random() * 1.5 + 0.4,
+      a: Math.random() * 0.6 + 0.2,
+    });
+  }
+
+  function resetGame() {
+    state.running = true;
+    state.over = false;
+    state.score = 0;
+    state.lives = 3;
+    state.objects = [];
+    state.spawnInterval = 750;
+    state.lastSpawn = 0;
+    state.lastFrame = performance.now();
+    state.playerX = W / 2 - state.playerW / 2;
+    overlay.classList.add('hidden');
+  }
+
+  // ==== УПРАВЛЕНИЕ ====
+  let pointerActive = false;
+  let pointerX = 0;
+  const keys = { left: false, right: false };
+
+  function updatePointer(clientX) {
+    pointerX = clientX - state.playerW / 2;
+  }
+
+  canvas.addEventListener('pointerdown', e => {
+    pointerActive = true;
+    updatePointer(e.clientX);
+  });
+  canvas.addEventListener('pointermove', e => {
+    if (pointerActive) updatePointer(e.clientX);
+  });
+  canvas.addEventListener('pointerup', () => { pointerActive = false; });
+  canvas.addEventListener('pointercancel', () => { pointerActive = false; });
+
+  window.addEventListener('keydown', e => {
+    if (e.key === 'ArrowLeft' || e.key === 'a') keys.left = true;
+    if (e.key === 'ArrowRight' || e.key === 'd') keys.right = true;
+    if (e.key === ' ' && state.over) resetGame();
+  });
+  window.addEventListener('keyup', e => {
+    if (e.key === 'ArrowLeft' || e.key === 'a') keys.left = false;
+    if (e.key === 'ArrowRight' || e.key === 'd') keys.right = false;
+  });
+
+  startBtn.addEventListener('click', resetGame);
+
+  // ==== СПАВН ОБЪЕКТОВ ====
+  const TYPES = { GIFT: 0, STAR: 1, BOMB: 2 };
+
+  function spawnObject() {
+    const size = Math.min(80, W * 0.16);
+    const x = Math.random() * (W - size);
+    const r = Math.random();
+    let type;
+    if (r < 0.55) type = TYPES.GIFT;
+    else if (r < 0.80) type = TYPES.STAR;
+    else type = TYPES.BOMB;
+
+    state.objects.push({
+      x, y: -size, size, type,
+      speed: 140 + Math.random() * 120 + state.score * 0.3,
+      alive: true,
+      rot: 0,
+      rotSpeed: (Math.random() - 0.5) * 3,
+    });
+  }
+
+  // ==== ОБНОВЛЕНИЕ ====
+  function update(dt) {
+    if (!state.running) return;
+
+    // Движение игрока (клавиатура)
+    const kbSpeed = 500 * dt;
+    if (keys.left) state.playerX -= kbSpeed;
+    if (keys.right) state.playerX += kbSpeed;
+    if (pointerActive) state.playerX = pointerX;
+
+    // Ограничиваем
+    state.playerX = Math.max(0, Math.min(W - state.playerW, state.playerX));
+
+    const now = performance.now();
+
+    // Спавн
+    if (now - state.lastSpawn > state.spawnInterval) {
+      state.lastSpawn = now;
+      spawnObject();
+      if (state.spawnInterval > 380) state.spawnInterval -= 4;
+    }
+
+    const playerY = H - 130;
+
+    // Движение объектов
+    for (const o of state.objects) {
+      if (!o.alive) continue;
+      o.y += o.speed * dt;
+      o.rot += o.rotSpeed * dt;
+
+      // Столкновение с корзиной
+      if (o.y + o.size > playerY &&
+          o.y < playerY + state.playerH &&
+          o.x + o.size > state.playerX &&
+          o.x < state.playerX + state.playerW) {
+        o.alive = false;
+        if (o.type === TYPES.BOMB) {
+          state.lives--;
+          if (state.lives <= 0) gameOver();
+        } else if (o.type === TYPES.GIFT) {
+          state.score += 10;
+        } else {
+          state.score += 25;
+        }
+      }
+
+      // Пропущенный объект
+      if (o.y > H) {
+        o.alive = false;
+        if (o.type !== TYPES.BOMB) {
+          state.lives--;
+          if (state.lives <= 0) gameOver();
+        }
+      }
+    }
+
+    state.objects = state.objects.filter(o => o.alive);
+  }
+
+  function gameOver() {
+    state.running = false;
+    state.over = true;
+    if (state.score > state.best) {
+      state.best = state.score;
+      localStorage.setItem('giftBest', String(state.best));
+    }
+    overlay.classList.remove('hidden');
+    overlay.innerHTML = `
+      <h1>Игра окончена</h1>
+      <p>Счёт: <b>${state.score}</b><br>Рекорд: <b>${state.best}</b></p>
+      <button id="restartBtn">Играть снова</button>
+    `;
+    document.getElementById('restartBtn').addEventListener('click', resetGame);
+  }
+
+  // ==== ОТРИСОВКА ====
+  function drawStar(cx, cy, r, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    for (let i = 0; i < 5; i++) {
+      const outerAngle = (i * 2 * Math.PI) / 5 - Math.PI / 2;
+      const innerAngle = outerAngle + Math.PI / 5;
+      ctx.lineTo(cx + Math.cos(outerAngle) * r, cy + Math.sin(outerAngle) * r);
+      ctx.lineTo(cx + Math.cos(innerAngle) * r * 0.45, cy + Math.sin(innerAngle) * r * 0.45);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawGift(x, y, size) {
+    // Коробка
+    ctx.fillStyle = '#dc2828';
+    ctx.fillRect(x, y, size, size);
+    // Ленточка
+    ctx.fillStyle = '#ffd700';
+    ctx.fillRect(x + size / 2 - size * 0.08, y, size * 0.16, size);
+    ctx.fillRect(x, y + size / 2 - size * 0.08, size, size * 0.16);
+    // Бантик
+    ctx.beginPath();
+    ctx.arc(x + size * 0.35, y - size * 0.08, size * 0.15, 0, Math.PI * 2);
+    ctx.arc(x + size * 0.65, y - size * 0.08, size * 0.15, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffd700';
+    ctx.fill();
+  }
+
+  function drawBomb(x, y, size) {
+    const cx = x + size / 2, cy = y + size / 2;
+    ctx.fillStyle = '#1a1a1a';
+    ctx.beginPath();
+    ctx.arc(cx, cy, size / 2, 0, Math.PI * 2);
+    ctx.fill();
+    // Блеск
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.beginPath();
+    ctx.arc(cx - size * 0.15, cy - size * 0.15, size * 0.1, 0, Math.PI * 2);
+    ctx.fill();
+    // Фитиль
+    ctx.strokeStyle = '#a06030';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - size / 2);
+    ctx.lineTo(cx + size * 0.15, cy - size / 2 - size * 0.2);
+    ctx.stroke();
+    // Искра
+    ctx.fillStyle = '#ff6000';
+    ctx.beginPath();
+    ctx.arc(cx + size * 0.15, cy - size / 2 - size * 0.2, size * 0.07, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function render() {
+    // Фон — градиент
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#1a2050');
+    g.addColorStop(1, '#0a0f28');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // Декоративные звёзды
+    for (const s of state.stars) {
+      ctx.fillStyle = `rgba(255,255,255,${s.a})`;
+      ctx.beginPath();
+      ctx.arc(s.x * W, s.y * H, s.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Объекты
+    for (const o of state.objects) {
+      if (o.type === TYPES.GIFT) {
+        drawGift(o.x, o.y, o.size);
+      } else if (o.type === TYPES.STAR) {
+        ctx.save();
+        ctx.translate(o.x + o.size / 2, o.y + o.size / 2);
+        ctx.rotate(o.rot);
+        drawStar(0, 0, o.size / 2, '#ffdc28');
+        ctx.restore();
+      } else {
+        drawBomb(o.x, o.y, o.size);
+      }
+    }
+
+    // Корзина-игрок
+    const py = H - 130;
+    // Тень
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.beginPath();
+    ctx.ellipse(state.playerX + state.playerW / 2, py + state.playerH + 8,
+                state.playerW * 0.5, 8, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Корпус
+    ctx.fillStyle = '#c88c28';
+    ctx.fillRect(state.playerX, py, state.playerW, state.playerH);
+    // Ободок
+    ctx.fillStyle = '#ffc864';
+    ctx.fillRect(state.playerX, py, state.playerW, 10);
+    // Плетение
+    ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+    ctx.lineWidth = 2;
+    for (let i = 1; i < 4; i++) {
+      ctx.beginPath();
+      ctx.moveTo(state.playerX + (state.playerW / 4) * i, py);
+      ctx.lineTo(state.playerX + (state.playerW / 4) * i, py + state.playerH);
+      ctx.stroke();
+    }
+
+    // HUD
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 24px Arial';
+    ctx.textAlign = 'left';
+    ctx.fillText('Счёт: ' + state.score, 16, 40);
+
+    ctx.textAlign = 'right';
+    ctx.fillText('❤️'.repeat(Math.max(0, state.lives)), W - 16, 40);
+
+    ctx.font = '14px Arial';
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.textAlign = 'left';
+    ctx.fillText('Рекорд: ' + state.best, 16, 64);
+  }
+
+  // ==== ИГРОВОЙ ЦИКЛ ====
+  function loop(now) {
+    const dt = Math.min(0.05, (now - state.lastFrame) / 1000);
+    state.lastFrame = now;
+
+    update(dt);
+    render();
+
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  // Первичная отрисовка фона до старта
+  state.playerX = W / 2 - state.playerW / 2;
+})();
+</script>
+</body>
+</html>
